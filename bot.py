@@ -1,312 +1,312 @@
-import os
-import asyncio
-import threading
+import os, time, threading, asyncio, logging
 from datetime import datetime, timezone
-
+from collections import defaultdict
 import requests
 from flask import Flask, jsonify
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-BACKEND_URL = os.getenv(
-    "TRADEPILOT_BACKEND_URL",
-    "https://tradepilot-live-backend.onrender.com",
-).rstrip("/")
-POLL_SECONDS = max(15, int(os.getenv("AUTO_POLL_SECONDS", "15")))
+TWELVE_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
 
-app = Flask(__name__)
-subscriptions = {}
-subscriptions_lock = threading.Lock()
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
+TWELVE_URL = "https://api.twelvedata.com/time_series"
 
-# These match the current backend timeframes.
-SYMBOLS = ["BTCUSD", "ETHUSD", "XAUUSD", "EURUSD", "GBPUSD", "USDJPY"]
-TFS = ["1m", "5m", "15m", "1h", "4h"]
+SYMBOLS = {
+    "crypto": {"BTCUSD":"BTCUSDT", "ETHUSD":"ETHUSDT"},
+    "forex": {
+        "EURUSD":"EUR/USD","GBPUSD":"GBP/USD","USDJPY":"USD/JPY",
+        "USDCHF":"USD/CHF","USDCAD":"USD/CAD","AUDUSD":"AUD/USD",
+        "NZDUSD":"NZD/USD","XAUUSD":"XAU/USD"
+    }
+}
+TFS = {"1m":"1min","5m":"5min","15m":"15min","1h":"1h","4h":"4h"}
+BINANCE_TF = {"1m":"1m","5m":"5m","15m":"15m","1h":"1h","4h":"4h"}
 
+# Central cache: one market request can serve many Telegram users.
+CACHE_TTL = {"1m":20, "5m":45, "15m":90, "1h":180, "4h":300}
+cache = {}
+cache_lock = threading.Lock()
+user_auto = {}  # chat_id -> {"symbol":..., "tf":..., "last_candle":...}
 
-def api_market(symbol: str, tf: str) -> dict:
-    response = requests.get(
-        f"{BACKEND_URL}/market",
-        params={"symbol": symbol, "tf": tf},
-        timeout=25,
-        headers={"User-Agent": "TradePilot-Telegram/2.0"},
-    )
-    response.raise_for_status()
-    return response.json()
+def utcnow():
+    return datetime.now(timezone.utc)
 
+def market_open(symbol):
+    if symbol in SYMBOLS["crypto"]:
+        return True
+    d=utcnow()
+    day=d.weekday()
+    mins=d.hour*60+d.minute
+    return not (day==5 and mins>=1260 or day==6 or day==0 and mins<1260)
 
-def fmt_price(value):
-    if value is None:
-        return "—"
+def http_json(url, params, timeout=10):
+    r=requests.get(url, params=params, timeout=timeout,
+                   headers={"User-Agent":"TradePilot-Live/1.0"})
+    if r.status_code == 429:
+        raise RuntimeError("RATE_LIMIT")
+    r.raise_for_status()
+    data=r.json()
+    if isinstance(data, dict) and data.get("status") == "error":
+        raise RuntimeError(data.get("message","provider error"))
+    return data
+
+def fetch_crypto(symbol, tf, limit=180):
+    data=http_json(BINANCE_URL, {"symbol":SYMBOLS["crypto"][symbol],
+                                 "interval":BINANCE_TF[tf],"limit":limit})
+    if not isinstance(data,list) or len(data)<60:
+        raise RuntimeError("INSUFFICIENT_DATA")
+    return [{"time":int(x[0]),"open":float(x[1]),"high":float(x[2]),
+             "low":float(x[3]),"close":float(x[4]),"volume":float(x[5])} for x in data], "Binance Spot"
+
+def fetch_forex(symbol, tf, limit=180):
+    if not TWELVE_KEY:
+        raise RuntimeError("NO_TWELVE_KEY")
+    data=http_json(TWELVE_URL, {"symbol":SYMBOLS["forex"][symbol],
+                                "interval":TFS[tf],"outputsize":limit,
+                                "apikey":TWELVE_KEY,"timezone":"UTC","format":"JSON"})
+    vals=data.get("values")
+    if not vals or len(vals)<60:
+        raise RuntimeError("INSUFFICIENT_DATA")
+    vals=list(reversed(vals))
+    out=[]
+    for x in vals:
+        s=x["datetime"]
+        dt=datetime.fromisoformat(s.replace("Z","+00:00"))
+        if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
+        out.append({"time":int(dt.timestamp()*1000),"open":float(x["open"]),
+                    "high":float(x["high"]),"low":float(x["low"]),
+                    "close":float(x["close"]),"volume":float(x.get("volume") or 0)})
+    return out, "Twelve Data"
+
+def get_candles(symbol, tf):
+    key=(symbol,tf); now=time.time()
+    with cache_lock:
+        item=cache.get(key)
+        if item and now-item["fetched"] < CACHE_TTL[tf]:
+            return item["candles"], item["source"], False
     try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return str(value)
-    return f"{value:,.2f}" if abs(value) >= 100 else f"{value:,.5f}"
-
-
-def signal_text(data: dict, symbol: str, tf: str, auto: bool = False) -> str:
-    if data.get("error"):
-        error = data.get("error")
-        if error == "market_closed":
-            return f"⏸ <b>{symbol} · {tf}</b>\n\n🔒 Market closed."
-        if error in {"data_stale", "live_data_unavailable"}:
-            return f"⚠️ <b>{symbol} · {tf}</b>\n\n🕐 Verified live data is unavailable or stale.\nNo signal generated."
-        return (
-            f"⚠️ <b>{symbol} · {tf}</b>\n\n"
-            f"❌ Live data unavailable.\n"
-            f"<code>{str(data.get('message', error))[:500]}</code>"
-        )
-
-    signal = str(data.get("signal", "WAIT")).upper()
-    icon = {"BUY": "🟢", "SELL": "🔴", "CALL": "🟢", "PUT": "🔴", "WAIT": "🟡"}.get(signal, "🟡")
-    lines = [
-        f"{icon} <b>{signal}</b>  |  <b>{symbol} · {tf}</b>",
-        "",
-        f"💰 Price: <b>{fmt_price(data.get('entry'))}</b>",
-        f"📈 Trend: <b>{data.get('trend', '—')}</b>",
-        f"🎯 Confidence: <b>{data.get('confidence', 0)}%</b>",
-        f"📊 RSI: <b>{data.get('rsi', '—')}</b>",
-        f"〽️ MACD: <b>{data.get('macd', '—')}</b>",
-        f"💪 ADX: <b>{data.get('adx', '—')}</b>",
-        f"🏗 Structure: <b>{data.get('structure', '—')}</b>",
-        "",
-        f"📡 {data.get('source', 'verified data')}",
-        f"🕐 Candle: <code>{data.get('timestamp', '—')}</code>",
-    ]
-    if signal in {"BUY", "SELL", "CALL", "PUT"}:
-        lines.extend([
-            f"🛑 SL: <b>{fmt_price(data.get('sl'))}</b>",
-            f"🎯 TP1: <b>{fmt_price(data.get('tp1'))}</b>",
-            f"🎯 TP2: <b>{fmt_price(data.get('tp2'))}</b>",
-        ])
-    lines.extend(["", f"💡 {data.get('reason', 'No setup.')}" ])
-    if auto:
-        lines.extend(["", "🤖 <i>Automatic signal</i>"])
-    return "\n".join(lines)
-
-
-def main_menu():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📊 Get Signal", callback_data="menu_signal"),
-            InlineKeyboardButton("🤖 Auto Signal", callback_data="menu_auto"),
-        ],
-        [
-            InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings"),
-            InlineKeyboardButton("⏹ Stop Auto", callback_data="stop"),
-        ],
-    ])
-
-
-def symbol_menu(prefix: str):
-    rows = []
-    for i in range(0, len(SYMBOLS), 3):
-        rows.append([
-            InlineKeyboardButton(symbol, callback_data=f"{prefix}_sym_{symbol}")
-            for symbol in SYMBOLS[i:i + 3]
-        ])
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="home")])
-    return InlineKeyboardMarkup(rows)
-
-
-def tf_menu(prefix: str, symbol: str):
-    rows = []
-    for i in range(0, len(TFS), 3):
-        rows.append([
-            InlineKeyboardButton(tf, callback_data=f"{prefix}_tf_{symbol}_{tf}")
-            for tf in TFS[i:i + 3]
-        ])
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="menu_signal")])
-    return InlineKeyboardMarkup(rows)
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🚀 <b>TradePilot Telegram</b>\n\n"
-        "Verified live market analysis.\n\nChoose an option:",
-        parse_mode="HTML",
-        reply_markup=main_menu(),
-    )
-
-
-async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📊 Select symbol:", reply_markup=symbol_menu("sig"))
-
-
-async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 Select symbol for Auto Signal:", reply_markup=symbol_menu("auto"))
-
-
-async def stop_for_chat(chat_id: int):
-    with subscriptions_lock:
-        subscription = subscriptions.pop(chat_id, None)
-    if subscription:
-        task = subscription.get("task")
-        if task and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-
-async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await stop_for_chat(update.effective_chat.id)
-    await update.message.reply_text("⏹ Auto Signal stopped.", reply_markup=main_menu())
-
-
-async def auto_loop(application: Application, chat_id: int, symbol: str, tf: str):
-    last_candle = None
-    try:
-        while True:
-            try:
-                data = await asyncio.to_thread(api_market, symbol, tf)
-                candle = data.get("timestamp")
-
-                # Only send once for each new backend candle.
-                if candle and candle != last_candle:
-                    last_candle = candle
-                    # Do not generate a signal when data is unavailable/stale.
-                    if not data.get("error") or data.get("error") == "market_closed":
-                        await application.bot.send_message(
-                            chat_id=chat_id,
-                            text=signal_text(data, symbol, tf, auto=True),
-                            parse_mode="HTML",
-                        )
-            except requests.RequestException:
-                pass
-            except Exception:
-                pass
-
-            await asyncio.sleep(POLL_SECONDS)
-    except asyncio.CancelledError:
+        if symbol in SYMBOLS["crypto"]:
+            candles,source=fetch_crypto(symbol,tf)
+        else:
+            candles,source=fetch_forex(symbol,tf)
+        with cache_lock:
+            cache[key]={"fetched":time.time(),"candles":candles,"source":source}
+        return candles,source,True
+    except Exception as e:
+        # Never turn stale data into a fresh signal. Cached data can only be
+        # used for display if it is still inside its candle-specific age.
+        with cache_lock:
+            item=cache.get(key)
+        if item:
+            return item["candles"], item["source"], False
         raise
 
+def ema(vals,n):
+    if len(vals)<n:return [None]*len(vals)
+    out=[None]*len(vals); k=2/(n+1); out[n-1]=sum(vals[:n])/n
+    for i in range(n,len(vals)): out[i]=vals[i]*k+out[i-1]*(1-k)
+    return out
 
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
-    chat_id = query.message.chat_id
+def rsi(vals,n=14):
+    if len(vals)<n+1:return None
+    gains=[]; losses=[]
+    for i in range(1,len(vals)):
+        d=vals[i]-vals[i-1]; gains.append(max(d,0)); losses.append(max(-d,0))
+    g=sum(gains[:n])/n; l=sum(losses[:n])/n
+    for i in range(n,len(gains)):
+        g=(g*(n-1)+gains[i])/n; l=(l*(n-1)+losses[i])/n
+    return 100 if l==0 else 100-100/(1+g/l)
 
-    if data == "home":
-        await query.edit_message_text(
-            "🚀 <b>TradePilot</b>\n\nChoose an option:",
-            parse_mode="HTML",
-            reply_markup=main_menu(),
-        )
-        return
+def atr(c,n=14):
+    if len(c)<n+1:return None
+    tr=[]
+    for i in range(1,len(c)):
+        tr.append(max(c[i]["high"]-c[i]["low"],
+                      abs(c[i]["high"]-c[i-1]["close"]),
+                      abs(c[i]["low"]-c[i-1]["close"])))
+    return sum(tr[-n:])/n
 
-    if data == "menu_signal":
-        await query.edit_message_text("📊 Select symbol:", reply_markup=symbol_menu("sig"))
-        return
+def adx(c,n=14):
+    if len(c)<n*2+1:return None
+    trs=[]; plus=[]; minus=[]
+    for i in range(1,len(c)):
+        up=c[i]["high"]-c[i-1]["high"]; down=c[i-1]["low"]-c[i]["low"]
+        trs.append(max(c[i]["high"]-c[i]["low"],abs(c[i]["high"]-c[i-1]["close"]),abs(c[i]["low"]-c[i-1]["close"])))
+        plus.append(up if up>down and up>0 else 0); minus.append(down if down>up and down>0 else 0)
+    a=sum(trs[:n])/n;p=sum(plus[:n])/n;m=sum(minus[:n])/n; dx=[]
+    for i in range(n,len(trs)):
+        a=(a*(n-1)+trs[i])/n;p=(p*(n-1)+plus[i])/n;m=(m*(n-1)+minus[i])/n
+        di1=100*p/max(a,1e-12); di2=100*m/max(a,1e-12)
+        dx.append(100*abs(di1-di2)/max(di1+di2,1e-12))
+    return sum(dx[-n:])/min(n,len(dx)) if dx else None
 
-    if data == "menu_auto":
-        await query.edit_message_text("🤖 Select symbol for Auto Signal:", reply_markup=symbol_menu("auto"))
-        return
+def analyze(c,tf):
+    # Exclude the still-forming candle for signal confirmation when possible.
+    work=c[:-1] if len(c)>70 else c
+    closes=[x["close"] for x in work]
+    e20=ema(closes,20)[-1]; e50=ema(closes,50)[-1]
+    r=rsi(closes); a=adx(work); at=atr(work)
+    e12=ema(closes,12); e26=ema(closes,26)
+    macd=(e12[-1]-e26[-1]) if e12[-1] is not None and e26[-1] is not None else None
+    macd_prev=(e12[-2]-e26[-2]) if e12[-2] is not None and e26[-2] is not None else None
+    last=work[-1]; prev=work[-2]
+    bull=e20 is not None and e50 is not None and e20>e50 and last["close"]>e20
+    bear=e20 is not None and e50 is not None and e20<e50 and last["close"]<e20
+    bullish_candle=last["close"]>last["open"] and last["close"]>=prev["close"]
+    bearish_candle=last["close"]<last["open"] and last["close"]<=prev["close"]
+    bull_score=sum([bull, r is not None and r>50, macd is not None and macd>0 and (macd_prev is None or macd>=macd_prev),
+                    a is not None and a>=18, bullish_candle])
+    bear_score=sum([bear, r is not None and r<50, macd is not None and macd<0 and (macd_prev is None or macd<=macd_prev),
+                    a is not None and a>=18, bearish_candle])
+    if bull_score>=4 and not bear:
+        sig="BUY"; conf=60+8*min(bull_score-4,3)
+    elif bear_score>=4 and not bull:
+        sig="SELL"; conf=60+8*min(bear_score-4,3)
+    else:
+        sig="WAIT"; conf=max(bull_score,bear_score)*15
+    # Explicit trend protection: never emit against trend.
+    if sig=="BUY" and not bull: sig="WAIT"
+    if sig=="SELL" and not bear: sig="WAIT"
+    return {
+        "signal":sig,"confidence":min(90,int(conf)),
+        "rsi":None if r is None else round(r,2),
+        "adx":None if a is None else round(a,2),
+        "trend":"BULLISH" if bull else "BEARISH" if bear else "NEUTRAL",
+        "entry":last["close"],"candleTime":last["time"],
+        "reason":("Trend + momentum + confirmation aligned." if sig!="WAIT" else "Conditions are not sufficiently aligned; signal locked to WAIT.")
+    }
 
-    if data == "menu_settings":
-        await query.edit_message_text(
-            f"⚙️ <b>Settings</b>\n\nAuto polling: {POLL_SECONDS}s\nBackend: <code>{BACKEND_URL}</code>",
-            parse_mode="HTML",
-            reply_markup=main_menu(),
-        )
-        return
+def get_signal(symbol,tf,binary=False):
+    if symbol not in SYMBOLS["crypto"] and symbol not in SYMBOLS["forex"]:
+        raise RuntimeError("UNSUPPORTED_SYMBOL")
+    if tf not in TFS: raise RuntimeError("UNSUPPORTED_TIMEFRAME")
+    if not market_open(symbol): return {"error":"market_closed"}
+    candles,source,_=get_candles(symbol,tf)
+    d=analyze(candles,tf)
+    now_ms=int(time.time()*1000)
+    age=now_ms-d["candleTime"]
+    # Timeframe-aware freshness. Crypto and FX differ only in provider latency.
+    max_age={"1m":180000,"5m":420000,"15m":1000000,"1h":3700000,"4h":14500000}[tf]
+    if age<0 or age>max_age:
+        return {"error":"data_stale","dataAgeMs":age}
+    d.update({"source":source+" • verified live candles","dataAgeMs":age,
+              "timestamp":datetime.fromtimestamp(d["candleTime"]/1000,timezone.utc).isoformat()})
+    if binary:
+        d["signal"]={"BUY":"CALL","SELL":"PUT","WAIT":"WAIT"}[d["signal"]]
+    return d
 
-    if data == "stop":
-        await stop_for_chat(chat_id)
-        await query.edit_message_text("⏹ Auto Signal stopped.", reply_markup=main_menu())
-        return
-
-    parts = data.split("_")
-    if len(parts) >= 3 and parts[1] == "sym":
-        mode, symbol = parts[0], parts[2]
-        await query.edit_message_text(
-            f"<b>{symbol}</b> selected. Choose timeframe:",
-            parse_mode="HTML",
-            reply_markup=tf_menu(mode, symbol),
-        )
-        return
-
-    if len(parts) >= 4 and parts[1] == "tf":
-        mode, symbol, tf = parts[0], parts[2], parts[3]
-
-        if mode == "sig":
-            await query.edit_message_text("⏳ Checking verified live market…")
-            try:
-                market = await asyncio.to_thread(api_market, symbol, tf)
-                await query.edit_message_text(
-                    signal_text(market, symbol, tf),
-                    parse_mode="HTML",
-                    reply_markup=main_menu(),
-                )
-            except Exception as exc:
-                await query.edit_message_text(
-                    f"❌ Backend error:\n<code>{str(exc)[:700]}</code>",
-                    parse_mode="HTML",
-                    reply_markup=main_menu(),
-                )
-            return
-
-        await stop_for_chat(chat_id)
-        task = asyncio.create_task(auto_loop(context.application, chat_id, symbol, tf))
-        with subscriptions_lock:
-            subscriptions[chat_id] = {
-                "symbol": symbol,
-                "tf": tf,
-                "task": task,
-                "enabled": True,
-            }
-        await query.edit_message_text(
-            f"🤖 <b>Auto Signal ON</b>\n\n"
-            f"Symbol: <b>{symbol}</b>\n"
-            f"Timeframe: <b>{tf}</b>\n"
-            f"Check interval: <b>{POLL_SECONDS}s</b>\n\n"
-            "The bot will automatically check for each new candle.\n"
-            "Use /stop to stop it.",
-            parse_mode="HTML",
-            reply_markup=main_menu(),
-        )
-
+# ---------------- Flask health/API ----------------
+app=Flask(__name__)
 
 @app.get("/")
-def root():
-    return jsonify({
-        "service": "TradePilot Telegram Bot",
-        "status": "ok",
-        "backend": BACKEND_URL,
-        "subscriptions": len(subscriptions),
-    })
-
+def root(): return jsonify({"service":"TradePilot Telegram","status":"ok"})
 
 @app.get("/health")
-def health():
-    return jsonify({
-        "status": "ok",
-        "subscriptions": len(subscriptions),
-        "time": datetime.now(timezone.utc).isoformat(),
-    })
+def health(): return jsonify({"status":"ok","service":"TradePilot","time":utcnow().isoformat()})
 
+@app.get("/market")
+def market():
+    symbol=os.getenv("QUERY_SYMBOL","")
+    return jsonify({"error":"Use Telegram bot commands; public market endpoint is intentionally disabled."}), 404
 
-def run_web():
-    # Flask only supplies Render's health/HTTP port; Telegram runs on the main asyncio loop.
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+# ---------------- Telegram ----------------
+async def start(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    kb=[[InlineKeyboardButton("📊 Get Signal",callback_data="signal")],
+        [InlineKeyboardButton("⚙️ Auto Signal",callback_data="auto")],
+        [InlineKeyboardButton("⛔ Stop Auto",callback_data="stop")]]
+    await update.message.reply_text("🚀 TradePilot Live\n\nLive-data signal bot. No verified data = no signal.\n\nChoose an option:",
+                                    reply_markup=InlineKeyboardMarkup(kb))
 
+def symbol_kb():
+    syms=list(SYMBOLS["crypto"])+list(SYMBOLS["forex"])
+    return InlineKeyboardMarkup([[InlineKeyboardButton(s,callback_data=f"s:{s}") for s in syms[i:i+2]] for i in range(0,len(syms),2)])
 
-async def telegram_main():
-    application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("signal", signal_cmd))
-    application.add_handler(CommandHandler("auto", auto_cmd))
-    application.add_handler(CommandHandler("stop", stop_cmd))
-    application.add_handler(CallbackQueryHandler(callbacks))
+def tf_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton(x,callback_data=f"t:{x}") for x in ["1m","5m","15m"]],
+                                 [InlineKeyboardButton(x,callback_data=f"t:{x}") for x in ["1h","4h"]]])
 
+def fmt_signal(s, symbol, tf):
+    if "error" in s:
+        m={"market_closed":"🔴 MARKET CLOSED","data_stale":"🟡 DATA STALE","RATE_LIMIT":"🟡 DATA PROVIDER RATE-LIMITED"}
+        return f"{m.get(s['error'],'🔴 NO LIVE DATA')}\n\n{symbol} • {tf}\nNo new verified signal was generated."
+    sig=s["signal"]
+    icon="🟢" if sig in ("BUY","CALL") else "🔴" if sig in ("SELL","PUT") else "🟡"
+    return (f"{icon} {sig}\n\n"
+            f"📊 {symbol} • {tf}\n"
+            f"📡 {s['source']}\n"
+            f"⏱ Data age: {max(0,int(s['dataAgeMs']/1000))}s\n"
+            f"📈 Trend: {s['trend']}\n"
+            f"RSI: {s['rsi'] if s['rsi'] is not None else '—'}\n"
+            f"ADX: {s['adx'] if s['adx'] is not None else '—'}\n"
+            f"Confidence: {s['confidence']}%\n"
+            f"💰 Entry: {s['entry']}\n\n"
+            f"📝 {s['reason']}\n\n"
+            f"⚠️ Rule-based analysis, not a profit guarantee.")
+
+async def signal_cmd(update,context):
+    await update.message.reply_text("Choose symbol:",reply_markup=symbol_kb())
+
+async def auto_cmd(update,context):
+    await update.message.reply_text("Choose symbol for Auto Signal:",reply_markup=symbol_kb())
+
+async def stop_cmd(update,context):
+    user_auto.pop(update.effective_chat.id,None)
+    await update.message.reply_text("⛔ Auto Signal stopped.")
+
+async def button(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    chat=q.message.chat_id
+    data=q.data
+    if data=="signal":
+        context.user_data["mode"]="once"; await q.edit_message_text("Choose symbol:",reply_markup=symbol_kb()); return
+    if data=="auto":
+        context.user_data["mode"]="auto"; await q.edit_message_text("Choose symbol for Auto Signal:",reply_markup=symbol_kb()); return
+    if data=="stop":
+        user_auto.pop(chat,None); await q.edit_message_text("⛔ Auto Signal stopped."); return
+    if data.startswith("s:"):
+        context.user_data["symbol"]=data[2:]
+        await q.edit_message_text(f"Symbol: {data[2:]}\nChoose timeframe:",reply_markup=tf_kb()); return
+    if data.startswith("t:"):
+        symbol=context.user_data.get("symbol"); tf=data[2:]; mode=context.user_data.get("mode","once")
+        if not symbol: await q.edit_message_text("Please choose symbol again with /signal."); return
+        if mode=="auto":
+            user_auto[chat]={"symbol":symbol,"tf":tf,"last_candle":None}
+            await q.edit_message_text(f"🟢 Auto Signal ON\n{symbol} • {tf}\n\nWaiting for the next verified candle.")
+        else:
+            try:
+                s=get_signal(symbol,tf,binary=False)
+                await q.edit_message_text(fmt_signal(s,symbol,tf))
+            except Exception as e:
+                await q.edit_message_text(f"🟡 NO LIVE DATA\n\n{symbol} • {tf}\n{str(e)}")
+
+async def auto_job(context:ContextTypes.DEFAULT_TYPE):
+    for chat, cfg in list(user_auto.items()):
+        try:
+            s=get_signal(cfg["symbol"],cfg["tf"],binary=False)
+            if "error" in s: continue
+            candle=s["candleTime"]
+            if cfg["last_candle"] == candle: continue
+            cfg["last_candle"]=candle
+            await context.bot.send_message(chat_id=chat,text=fmt_signal(s,cfg["symbol"],cfg["tf"]))
+        except Exception as e:
+            logging.warning("auto %s: %s",chat,e)
+
+async def run_bot():
+    application=Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start",start))
+    application.add_handler(CommandHandler("signal",signal_cmd))
+    application.add_handler(CommandHandler("auto",auto_cmd))
+    application.add_handler(CommandHandler("stop",stop_cmd))
+    application.add_handler(CallbackQueryHandler(button))
+    application.job_queue.run_repeating(auto_job, interval=20, first=10)
     await application.initialize()
     await application.start()
-    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-
+    await application.updater.start_polling(drop_pending_updates=True)
+    logging.info("Telegram polling started")
     try:
         await asyncio.Event().wait()
     finally:
@@ -314,14 +314,13 @@ async def telegram_main():
         await application.stop()
         await application.shutdown()
 
-
-async def main_async():
+def main():
     if not BOT_TOKEN:
-        raise SystemExit("TELEGRAM_BOT_TOKEN is not set")
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+    # Flask health endpoint in daemon thread; Telegram owns the main asyncio loop.
+    threading.Thread(target=lambda: app.run(host="0.0.0.0",port=PORT,debug=False,use_reloader=False),
+                     daemon=True).start()
+    asyncio.run(run_bot())
 
-    threading.Thread(target=run_web, daemon=True, name="render-health-server").start()
-    await telegram_main()
-
-
-if __name__ == "__main__":
-    asyncio.run(main_async())
+if __name__=="__main__":
+    main()
