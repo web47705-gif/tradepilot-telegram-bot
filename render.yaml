@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: tradepilot-telegram
+    name: tradepilot-telegram-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
@@ -10,4 +10,4 @@ services:
       - key: TWELVE_DATA_API_KEY
         sync: false
       - key: PORT
-        value: "10000"
+        value: 10000
