@@ -1,22 +1,33 @@
-# TradePilot Telegram Bot
+# TradePilot Telegram Bot — Rebuilt
 
-Standalone Telegram-only version of TradePilot. It uses the existing Render live backend for verified market candles and signal analysis.
+Telegram-only TradePilot bot for Render.
 
-## Environment variables
+## Fixed
+- Replaced `Application.run_polling()` startup with explicit asyncio lifecycle.
+- Avoids the `There is no current event loop in thread 'MainThread'` failure seen on Render.
+- Keeps Flask health endpoints for Render.
+- Automatic signals run on the same asyncio loop as Telegram.
+- Sends at most one automatic message per new backend candle.
+- Does not generate a signal when the backend reports unavailable/stale data.
+- Removed unsupported `30m` timeframe from the Telegram UI; the current backend supports `1m`, `5m`, `15m`, `1h`, `4h`.
 
-- `TELEGRAM_BOT_TOKEN` = token from BotFather
-- `TRADEPILOT_BACKEND_URL` = existing backend URL
-- `AUTO_POLL_SECONDS` = polling interval; default 15 seconds
+## Render
+Build Command:
 
-## Commands
+`pip install -r requirements.txt`
 
-- `/start` — main menu
-- `/signal` — one-time live signal
-- `/auto` — choose symbol/timeframe and start automatic signals
-- `/stop` — stop automatic signals
+Start Command:
 
-## Important
+`python bot.py`
 
-The bot sends an automatic message only when the backend reports a new candle timestamp. It does not generate a signal when verified market data is unavailable or stale.
+Environment variables:
 
-Deploy as a Render Web Service. Add the environment variables before deploying.
+- `TELEGRAM_BOT_TOKEN` — fresh token from BotFather
+- `TRADEPILOT_BACKEND_URL` — `https://tradepilot-live-backend.onrender.com`
+- `AUTO_POLL_SECONDS` — `15`
+
+## Telegram commands
+- `/start`
+- `/signal`
+- `/auto`
+- `/stop`
