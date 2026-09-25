@@ -33,8 +33,10 @@ TF_SECONDS = {"1m":60, "5m":300, "15m":900, "1h":3600, "4h":14400}
 TWELVE_TF = {"1m":"1min","5m":"5min","15m":"15min","1h":"1h","4h":"4h"}
 
 # One provider request can serve all Telegram users.
-CACHE_TTL = {"1m":45, "5m":120, "15m":240, "1h":600, "4h":1200}
+CACHE_TTL = {"1m":70, "5m":330, "15m":930, "1h":3700, "4h":14500}
+ERROR_COOLDOWN = 120
 cache = {}
+error_cache = {}
 cache_lock = threading.Lock()
 user_auto = {}
 
@@ -54,19 +56,24 @@ def market_open(symbol):
 
 def request_json(url, params=None, timeout=12):
     last = None
-    for attempt in range(3):
+    for attempt in range(4):
         try:
             r = SESSION.get(url, params=params, timeout=timeout)
             if r.status_code in (429, 451):
-                raise RuntimeError(f"PROVIDER_HTTP_{r.status_code}")
+                wait = int(r.headers.get("Retry-After", "0") or 0)
+                raise RuntimeError(f"PROVIDER_HTTP_{r.status_code}" + (f"_RETRY_{wait}" if wait else ""))
             r.raise_for_status()
             data = r.json()
-            if isinstance(data, dict) and data.get("status") == "error":
+            if isinstance(data, dict) and (data.get("status") == "error" or data.get("code")):
                 raise RuntimeError(data.get("message", "provider error"))
             return data
         except Exception as e:
             last = e
-            time.sleep(0.7 * (attempt + 1))
+            msg = str(e)
+            if "PROVIDER_HTTP_429" in msg:
+                time.sleep(min(20, 3 * (attempt + 1)))
+            else:
+                time.sleep(0.8 * (attempt + 1))
     raise last
 
 def normalize(rows):
@@ -103,7 +110,7 @@ def fetch_twelve(symbol, tf):
     data = request_json(TWELVE_URL, {
         "symbol": TWELVE_SYMBOLS[symbol],
         "interval": TWELVE_TF[tf],
-        "outputsize": 180,
+        "outputsize": 80,
         "apikey": TWELVE_KEY,
         "timezone": "UTC",
         "format": "JSON",
@@ -153,31 +160,35 @@ def get_candles(symbol, tf):
         item=cache.get(key)
         if item and now-item["fetched"] < CACHE_TTL[tf]:
             return item["candles"], item["source"]
+        err=error_cache.get(key)
+        if err and now-err["time"] < ERROR_COOLDOWN:
+            raise RuntimeError(err["message"])
 
     errors=[]
-    providers = []
     if symbol in CRYPTO:
         providers = [fetch_coinbase]
     else:
-        # Twelve Data if configured, otherwise Yahoo; Yahoo is also fallback.
-        providers = ([fetch_twelve, fetch_yahoo] if TWELVE_KEY else [fetch_yahoo])
+        # Forex/gold: Twelve Data is the primary source. Yahoo is only a backup.
+        providers = [fetch_twelve, fetch_yahoo] if TWELVE_KEY else [fetch_yahoo]
 
     for provider in providers:
         try:
             candles, source = provider(symbol,tf)
             with cache_lock:
                 cache[key]={"fetched":time.time(),"candles":candles,"source":source}
+                error_cache.pop(key, None)
             return candles, source
         except Exception as e:
-            errors.append(str(e))
-            logging.warning("%s %s %s: %s", provider.__name__, symbol, tf, e)
+            msg=str(e)
+            errors.append(msg)
+            logging.warning("%s %s %s: %s", provider.__name__, symbol, tf, msg)
 
-    # A recent cache is preferable to crashing the bot, but it will be marked stale.
     with cache_lock:
         item=cache.get(key)
+        error_cache[key]={"time":time.time(),"message":" / ".join(errors) if errors else "NO_LIVE_DATA"}
     if item:
         return item["candles"], item["source"]
-    raise RuntimeError(" / ".join(errors) if errors else "NO_LIVE_DATA")
+    raise RuntimeError(error_cache[key]["message"])
 
 def ema(values, n):
     if len(values)<n: return [None]*len(values)
@@ -357,7 +368,7 @@ async def run_bot():
     app_tg.add_handler(CommandHandler("auto",auto_cmd))
     app_tg.add_handler(CommandHandler("stop",stop_cmd))
     app_tg.add_handler(CallbackQueryHandler(button))
-    app_tg.job_queue.run_repeating(auto_job, interval=30, first=5)
+    app_tg.job_queue.run_repeating(auto_job, interval=60, first=10)
     await app_tg.initialize()
     await app_tg.start()
     await app_tg.updater.start_polling(drop_pending_updates=True)
